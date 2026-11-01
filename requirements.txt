@@ -1,0 +1,4 @@
+# AI Discovery Engine — graduation demo runtime
+streamlit==1.66.1
+pandas==3.1.0
+openpyxl==3.1.5

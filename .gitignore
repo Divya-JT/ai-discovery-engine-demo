@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+data/app/upload_sandbox.db
+data/app/upload_sandbox.db-*
