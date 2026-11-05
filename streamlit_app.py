@@ -2,10 +2,10 @@
 
 Design rules
 ------------
-* The live research database is opened read-only. The app never imports Pass 2,
-  reconciles, signs off, or changes the research schema.
-* Uploads are processed into an isolated sandbox database so the live research
-  corpus and M4 labels are untouched.
+* The research database is opened read-only. The app does not import, reconcile,
+  sign off, or change the research schema.
+* Uploads are processed into an isolated sandbox database so the stored research
+  corpus is untouched.
 * Theme, opportunity and Q&A output is derived from stored evidence text with
   transparent, deterministic rules. It is labelled exploratory, never presented
   as validated research findings.
@@ -30,10 +30,10 @@ import streamlit as st
 
 from config import (
     DATA_DIR,
-    DEFAULT_DB_PATH,
     EXPORTS_DIR,
     SOURCE_TYPE_VALUES,
     UPLOADS_DIR,
+    get_settings,
 )
 from database.db import connect
 from database.migrations import apply_migrations
@@ -171,6 +171,18 @@ PREDEFINED_QUESTIONS: list[dict[str, Any]] = [
         "title": "What do users say about returns and volatility?",
         "terms": ["return", "returns", "profit", "loss", "market", "volatility"],
     },
+    {
+        "title": "What causes missed or failed SIP instalments?",
+        "terms": ["missed", "miss", "failed", "failure", "debit", "mandate", "bank", "balance", "insufficient"],
+    },
+    {
+        "title": "What helps users continue their SIPs?",
+        "terms": ["continue", "continued", "continuing", "discipline", "long term", "long-term", "reminder", "automatic", "automated", "stay invested"],
+    },
+    {
+        "title": "How do life or goal changes affect SIPs?",
+        "terms": ["goal", "marriage", "child", "children", "house", "home", "education", "job", "job loss", "relocation", "family"],
+    },
 ]
 
 STOPWORDS = {
@@ -274,47 +286,6 @@ def load_meta(db_path: str, stamp: int) -> dict[str, Any]:
                 "FROM evidence GROUP BY 1 ORDER BY n DESC LIMIT 8"
             )
         ]
-        m4: dict[str, Any] = {}
-        if _has_table(conn, "screening_runs"):
-            run = conn.execute("SELECT * FROM screening_runs WHERE run_id=1").fetchone()
-            if run is not None:
-                m4 = {
-                    "run_id": run["run_id"],
-                    "state": conn.execute(
-                        "SELECT state FROM v_run_state WHERE run_id=1"
-                    ).fetchone()[0],
-                    "pass_1": _table_count(
-                        conn,
-                        "SELECT COUNT(*) FROM screening_annotations WHERE run_id=1 AND pass_no=1",
-                    ),
-                    "pass_2": _table_count(
-                        conn,
-                        "SELECT COUNT(*) FROM screening_annotations WHERE run_id=1 AND pass_no=2",
-                    ),
-                    "provenance": _table_count(
-                        conn,
-                        "SELECT COUNT(*) FROM screening_annotation_provenance WHERE run_id=1",
-                    ),
-                    "orders": _table_count(
-                        conn, "SELECT COUNT(*) FROM screening_pass2_orders WHERE run_id=1"
-                    ),
-                    "imports": _table_count(
-                        conn, "SELECT COUNT(*) FROM screening_pass2_imports WHERE run_id=1"
-                    ),
-                    "results": _table_count(
-                        conn, "SELECT COUNT(*) FROM screening_results WHERE run_id=1"
-                    ),
-                    "signoff": _table_count(
-                        conn,
-                        "SELECT COUNT(*) FROM screening_events WHERE run_id=1 "
-                        "AND event_type='review_completed'",
-                    ),
-                    "frozen_at": (
-                        conn.execute(
-                            "SELECT frozen_at FROM screening_pass1_freezes WHERE run_id=1"
-                        ).fetchone() or [None]
-                    )[0],
-                }
         ingestion = (
             _table_count(conn, "SELECT COUNT(*) FROM ingestion_runs")
             if _has_table(conn, "ingestion_runs")
@@ -334,7 +305,6 @@ def load_meta(db_path: str, stamp: int) -> dict[str, Any]:
             "by_source": by_source,
             "by_platform": by_platform,
             "last_created": last_created,
-            "m4": m4,
             "ingestion_runs": ingestion,
             "validated_themes": validated_themes,
         }
@@ -454,6 +424,47 @@ def build_opportunities(
     ]
 
 
+def rank_opportunities(
+    opportunities: pd.DataFrame,
+    *,
+    volume_weight: float = 0.7,
+    diversity_weight: float = 0.3,
+) -> pd.DataFrame:
+    """Re-rank opportunity hypotheses with transparent, editable weights.
+
+    Only evidence volume and source diversity are available before M5/M6 results;
+    the other original M7 dimensions are not fabricated.
+    """
+    if opportunities.empty:
+        return opportunities
+    ranked = opportunities.copy()
+    max_count = max(float(ranked["evidence_count"].max()), 1.0)
+    max_sources = max(float(ranked["source_count"].max()), 1.0)
+    total_weight = max(float(volume_weight) + float(diversity_weight), 1e-9)
+    ranked["priority_score"] = (
+        (
+            float(volume_weight) * ranked["evidence_count"] / max_count
+            + float(diversity_weight) * ranked["source_count"] / max_sources
+        )
+        / total_weight
+        * 100
+    ).round(1)
+    ranked = ranked.sort_values(
+        ["priority_score", "evidence_count", "source_count"], ascending=False
+    ).reset_index(drop=True)
+    ranked["rank"] = ranked.index + 1
+    ranked["reasoning"] = ranked.apply(
+        lambda row: (
+            f"{int(row['evidence_count'])} matching records across "
+            f"{int(row['source_count'])} source(s); transparent priority score "
+            f"{row['priority_score']:.1f}/100 using volume={volume_weight:.2f} "
+            f"and diversity={diversity_weight:.2f}."
+        ),
+        axis=1,
+    )
+    return ranked
+
+
 def _custom_terms(question: str) -> list[str]:
     tokens = re.findall(r"[a-z][a-z0-9_\-]{2,}", question.lower())
     return [token for token in tokens if token not in STOPWORDS]
@@ -509,7 +520,19 @@ def answer_question(
             ),
             "hits": hits,
             "matched_terms": matched,
+            "citations": [],
+            "locators": [],
+            "volume": 0,
+            "diversity": 0,
+            "confidence": "Low — no matching records.",
+            "limitations": [
+                "Extractive keyword retrieval only.",
+                "No M5 four-field screening results are available.",
+            ],
+            "gaps": ["No matching records; no contradiction assessment is possible."],
+            "contradictions": "Not assessed automatically.",
         }
+    source_names = hits["source_name"].fillna("").astype(str)
     return {
         "insufficient": False,
         "answer": (
@@ -519,6 +542,21 @@ def answer_question(
         ),
         "hits": hits,
         "matched_terms": matched,
+        "citations": hits["evidence_id"].tolist(),
+        "locators": hits["source_locator"].astype(str).tolist(),
+        "volume": int(len(hits)),
+        "diversity": int(source_names[source_names != ""].nunique()),
+        "confidence": "Low — exploratory keyword retrieval over unvalidated evidence.",
+        "limitations": [
+            "Extractive keyword retrieval only; no generative synthesis.",
+            "No M5 four-field screening results are available.",
+            "Results are not a prevalence, causal or validated finding.",
+        ],
+        "gaps": [
+            "Contradictions are not automatically assessed; review the source excerpts.",
+            "M5/M6 four-field results are required for a complete structured answer.",
+        ],
+        "contradictions": "Not assessed automatically.",
     }
 
 
@@ -739,22 +777,6 @@ def mentor_summary(
         f"- Duplicate records: {meta['duplicate']}",
         f"- Possible duplicates: {meta['possible_duplicate']}",
         "",
-        "## Discovery workflow",
-    ]
-    m4 = meta.get("m4") or {}
-    if m4:
-        lines += [
-            f"- Run 1 state: {m4.get('state')}",
-            f"- Pass 1 annotations: {m4.get('pass_1')}",
-            f"- Pass 2 annotations: {m4.get('pass_2')}",
-            f"- Pass 2 orders / imports: {m4.get('orders')} / {m4.get('imports')}",
-            f"- Results: {m4.get('results')}",
-            f"- Sign-off events: {m4.get('signoff')}",
-        ]
-    else:
-        lines.append("- No M4 run is present in this upload sandbox.")
-    lines += [
-        "",
         "## Top exploratory themes",
     ]
     if themes.empty:
@@ -779,7 +801,6 @@ def mentor_summary(
         "- The corpus is a non-probability convenience sample; no prevalence or market-size claim is supported.",
         "- Theme and opportunity signals are deterministic keyword-based exploration, not validated findings.",
         "- Research Q&A is extractive retrieval over stored text; it is not a generative or causal analysis.",
-        "- M4 Pass 2 is not imported and no reconciliation or sign-off has occurred in this app.",
         "- All metrics are computed from stored records; no synthetic demo metrics are shown.",
         "",
         "## Interpretation boundary",
@@ -814,38 +835,12 @@ def section_overview(meta: dict[str, Any], evidence: pd.DataFrame, source_label:
         ]
     )
     st.write("")
-    left, right = st.columns([1.45, 1])
-    with left:
-        st.markdown('<div class="ade-section-title">Evidence composition</div>', unsafe_allow_html=True)
-        if meta["by_source"]:
-            chart = pd.DataFrame(meta["by_source"]).set_index("source_type")
-            st.bar_chart(chart, height=260, color="#2dd4bf")
-        else:
-            st.info("No source distribution is available.")
-    with right:
-        st.markdown('<div class="ade-section-title">Discovery workflow</div>', unsafe_allow_html=True)
-        m4 = meta.get("m4") or {}
-        if m4:
-            st.markdown(
-                f"""
-                <div class="ade-status">
-                  <div><span class="ade-dot {'done' if m4.get('pass_1') else ''}"></span>
-                       Pass 1 annotations <b>{_fmt(m4.get('pass_1'))}</b></div>
-                  <div><span class="ade-dot {'done' if m4.get('orders') else ''}"></span>
-                       Pass 2 order <b>{'created' if m4.get('orders') else 'not created'}</b></div>
-                  <div><span class="ade-dot {'done' if m4.get('imports') else ''}"></span>
-                       Pass 2 import <b>{'done' if m4.get('imports') else 'pending'}</b></div>
-                  <div><span class="ade-dot {'done' if m4.get('signoff') else ''}"></span>
-                       Reconciliation sign-off <b>{'recorded' if m4.get('signoff') else 'pending'}</b></div>
-                </div>
-                <div class="ade-meta">Run 1 state: <b>{_esc(m4.get('state'))}</b> · Pass 2 annotations: {_fmt(m4.get('pass_2'))}</div>
-                """,
-                unsafe_allow_html=True,
-            )
-        elif source_label == "Upload sandbox":
-            st.info("This is the isolated upload sandbox; M4 workflow status does not apply.")
-        else:
-            st.info("No M4 run is present in this database.")
+    st.markdown('<div class="ade-section-title">Evidence composition</div>', unsafe_allow_html=True)
+    if meta["by_source"]:
+        chart = pd.DataFrame(meta["by_source"]).set_index("source_type")
+        st.bar_chart(chart, height=260, color="#2dd4bf")
+    else:
+        st.info("No source distribution is available.")
     st.write("")
     st.markdown('<div class="ade-section-title">What this application does</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
@@ -861,8 +856,7 @@ def section_upload() -> None:
     st.markdown('<div class="ade-kicker">PIPELINE</div>', unsafe_allow_html=True)
     st.markdown('<div class="ade-page-title">Upload & evidence processing</div>', unsafe_allow_html=True)
     st.caption(
-        "Files are processed into an isolated sandbox database. The live research corpus, M4 labels, "
-        "Pass 1 freeze and Pass 2 state are never modified."
+        "Files are processed into an isolated sandbox database. Uploads do not change the stored evidence."
     )
     uploaded = st.file_uploader(
         "Upload a research file", type=["csv", "xlsx", "xls"], accept_multiple_files=False
@@ -924,7 +918,7 @@ def section_upload() -> None:
                 mapping[field] = chosen
         st.caption(f"Suggested mapping: {suggested}")
 
-    if st.button("Validate file", type="secondary", use_container_width=True):
+    if st.button("Validate file", type="secondary", width="stretch"):
         try:
             summary = validate_upload(plan, mapping)
             preview = preview_records(plan, mapping, limit=12)
@@ -957,7 +951,7 @@ def section_upload() -> None:
                 for column in ("original_text", "source_name", "source_type", "platform", "_validation_ok")
                 if column in preview.columns
             ]
-            st.dataframe(preview[show], use_container_width=True, hide_index=True)
+            st.dataframe(preview[show], width="stretch", hide_index=True)
 
         can_ingest = (
             not plan.already_ingested
@@ -968,7 +962,7 @@ def section_upload() -> None:
             "Process valid records into sandbox",
             type="primary",
             disabled=not can_ingest,
-            use_container_width=True,
+            width="stretch",
         ):
             progress = st.progress(0, text="Processing evidence…")
             try:
@@ -1007,7 +1001,7 @@ def _upload_history() -> None:
         return
     if history:
         st.markdown('<div class="ade-section-title">Recent sandbox runs</div>', unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(history), width="stretch", hide_index=True)
 
 
 def section_explorer(evidence: pd.DataFrame, source_label: str) -> None:
@@ -1018,16 +1012,50 @@ def section_explorer(evidence: pd.DataFrame, source_label: str) -> None:
         st.warning("No evidence is available in this source.")
         return
     with st.expander("Filters", expanded=True):
-        search = st.text_input("Search text, evidence ID, platform or source", "")
-        c1, c2, c3 = st.columns(3)
         sources = sorted(evidence["source_type"].dropna().unique())
-        selected_sources = c1.multiselect("Source type", sources, default=sources)
+        platforms = sorted(evidence["platform"].fillna("Unknown").astype(str).unique())
         duplicates = sorted(evidence["duplicate_status"].dropna().unique())
-        selected_duplicates = c2.multiselect("Duplicate status", duplicates, default=duplicates)
         validations = sorted(evidence["validation_status"].dropna().unique())
-        selected_validation = c3.multiselect("Validation status", validations, default=validations)
+        defaults = {
+            "explorer_search": "",
+            "explorer_source": sources,
+            "explorer_platform": platforms,
+            "explorer_duplicate": duplicates,
+            "explorer_validation": validations,
+            "explorer_detail_search": "",
+        }
+        for key, value in defaults.items():
+            st.session_state.setdefault(key, value)
+
+        def _clear_explorer_filters() -> None:
+            for key, value in defaults.items():
+                st.session_state[key] = value
+
+        search = st.text_input(
+            "Search text, evidence ID, author, platform or source",
+            key="explorer_search",
+            placeholder="Try “SIP”, “EVD-”, an author or a platform",
+        )
+        c1, c2, c3 = st.columns(3)
+        selected_sources = c1.multiselect("Source type", sources, key="explorer_source")
+        selected_platforms = c2.multiselect("Platform", platforms, key="explorer_platform")
+        selected_duplicates = c3.multiselect(
+            "Duplicate status", duplicates, key="explorer_duplicate"
+        )
+        selected_validation = st.multiselect(
+            "Validation status", validations, key="explorer_validation"
+        )
+        st.button(
+            "Clear filters",
+            on_click=_clear_explorer_filters,
+            type="secondary",
+            width="content",
+        )
+
+    platform_view = evidence["platform"].fillna("Unknown").astype(str)
     view = evidence[
         evidence["source_type"].isin(selected_sources)
+        & platform_view.isin(selected_platforms)
         & evidence["duplicate_status"].isin(selected_duplicates)
         & evidence["validation_status"].isin(selected_validation)
     ]
@@ -1036,32 +1064,76 @@ def section_explorer(evidence: pd.DataFrame, source_label: str) -> None:
         mask = (
             view["text_lower"].str.contains(needle, regex=False, na=False)
             | view["evidence_id"].str.lower().str.contains(needle, regex=False, na=False)
+            | view["author"].fillna("").str.lower().str.contains(needle, regex=False, na=False)
             | view["platform"].fillna("").str.lower().str.contains(needle, regex=False, na=False)
             | view["source_name"].fillna("").str.lower().str.contains(needle, regex=False, na=False)
         )
         view = view[mask]
-    st.markdown(
-        f'<div class="ade-meta">{_fmt(len(view))} of {_fmt(len(evidence))} records shown</div>',
-        unsafe_allow_html=True,
+
+    filters_active = (
+        bool(search.strip())
+        or set(selected_sources) != set(sources)
+        or set(selected_platforms) != set(platforms)
+        or set(selected_duplicates) != set(duplicates)
+        or set(selected_validation) != set(validations)
     )
+    if filters_active:
+        st.markdown(
+            f'<div class="ade-meta">{_fmt(len(view))} of {_fmt(len(evidence))} records shown</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="ade-meta">All {_fmt(len(evidence))} records shown</div>',
+            unsafe_allow_html=True,
+        )
+    if view.empty:
+        st.info("No records match the current search and filters. Clear the search or widen the filters.")
     table = view[
         ["evidence_id", "source_name", "platform", "source_date", "duplicate_status", "validation_status"]
     ].copy()
-    st.dataframe(table, use_container_width=True, hide_index=True, height=320)
+    st.dataframe(table, width="stretch", hide_index=True, height=320)
     st.download_button(
         "Download filtered evidence CSV",
         evidence_download(view),
         file_name="evidence_export.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
-    if not view.empty:
-        selected = st.selectbox(
-            "Open evidence detail",
-            view["evidence_id"].tolist(),
-            format_func=lambda value: f"{value} · {view.loc[view['evidence_id'] == value, 'source_name'].iloc[0]}",
+
+    st.markdown('<div class="ade-section-title">Open evidence detail</div>', unsafe_allow_html=True)
+    detail_search = st.text_input(
+        "Find a record to inspect",
+        key="explorer_detail_search",
+        placeholder="Type an evidence ID, author, platform, or a phrase from the text",
+        help="Search first; the detail picker only lists matching records.",
+    )
+    detail_matches = view
+    if detail_search.strip():
+        detail_needle = detail_search.strip().lower()
+        detail_matches = view[
+            view["text_lower"].str.contains(detail_needle, regex=False, na=False)
+            | view["evidence_id"].str.lower().str.contains(detail_needle, regex=False, na=False)
+            | view["author"].fillna("").str.lower().str.contains(detail_needle, regex=False, na=False)
+            | view["platform"].fillna("").str.lower().str.contains(detail_needle, regex=False, na=False)
+            | view["source_name"].fillna("").str.lower().str.contains(detail_needle, regex=False, na=False)
+        ]
+    if not detail_search.strip():
+        st.caption(
+            f"Search above to open a record. {_fmt(len(view))} record(s) are in the current filter."
         )
-        row = view[view["evidence_id"] == selected].iloc[0]
+    elif detail_matches.empty:
+        st.info("No record matches that detail search. Try an evidence ID or a shorter phrase.")
+    else:
+        capped = detail_matches.head(50)
+        if len(detail_matches) > len(capped):
+            st.caption(f"Showing the first {len(capped)} of {_fmt(len(detail_matches))} matches. Refine the search to narrow further.")
+        selected = st.selectbox(
+            "Matching evidence",
+            capped["evidence_id"].tolist(),
+            format_func=lambda value: f"{value} · {capped.loc[capped['evidence_id'] == value, 'source_name'].iloc[0]}",
+        )
+        row = capped[capped["evidence_id"] == selected].iloc[0]
         with st.expander(f"Evidence {selected}", expanded=True):
             st.markdown(
                 f"""
@@ -1095,7 +1167,7 @@ def section_themes(evidence: pd.DataFrame, themes: pd.DataFrame, source_label: s
     st.markdown('<div class="ade-page-title">Theme discovery</div>', unsafe_allow_html=True)
     st.caption(
         f"Source: {source_label}. Deterministic keyword signals over verbatim evidence. "
-        "This is exploratory, not a validated M4 theme analysis."
+        "This is exploratory, not a validated theme analysis."
     )
     if themes.empty:
         st.warning("No exploratory theme signals were detected in this source.")
@@ -1129,13 +1201,13 @@ def section_themes(evidence: pd.DataFrame, themes: pd.DataFrame, source_label: s
             "opportunity": "Opportunity hypothesis",
         }
     )
-    st.dataframe(table, use_container_width=True, hide_index=True, height=300)
+    st.dataframe(table, width="stretch", hide_index=True, height=300)
     st.download_button(
         "Download theme table CSV",
         theme_download(themes),
         file_name="exploratory_themes.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
     selected = st.selectbox(
         "Inspect supporting evidence",
@@ -1148,7 +1220,12 @@ def section_themes(evidence: pd.DataFrame, themes: pd.DataFrame, source_label: s
         f"{int(row['source_count'])} sources · signal {row['signal_score']:.1f}/100"
     )
     st.caption(THEME_RULES[selected]["problem"])
-    hits = evidence[evidence["evidence_id"].isin(row["evidence_ids"])].head(8)
+    supporting = evidence[evidence["evidence_id"].isin(row["evidence_ids"])]
+    hits = supporting.head(8)
+    st.caption(
+        f"{_fmt(len(supporting))} supporting record(s) for this theme; "
+        f"showing the first {_fmt(len(hits))}."
+    )
     for _, record in hits.iterrows():
         with st.expander(f"{record['evidence_id']} · {record['source_name']}"):
             st.write(record["original_text"])
@@ -1172,7 +1249,26 @@ def section_opportunities(
             "No opportunity is shown rather than inventing one."
         )
         return
-    strongest = opportunities.iloc[0]
+    st.markdown('<div class="ade-section-title">Ranking weights</div>', unsafe_allow_html=True)
+    w1, w2 = st.columns(2)
+    volume_weight = w1.slider(
+        "Evidence volume weight", 0.0, 1.0, 0.7, 0.05,
+        help="Weight for the number of distinct supporting records.",
+    )
+    diversity_weight = w2.slider(
+        "Source diversity weight", 0.0, 1.0, 0.3, 0.05,
+        help="Weight for the number of distinct sources supporting the opportunity.",
+    )
+    st.caption(
+        "Only evidence volume and source diversity are available before M5/M6 four-field results. "
+        "The other original M7 scoring dimensions are not fabricated."
+    )
+    ranked = rank_opportunities(
+        opportunities,
+        volume_weight=volume_weight,
+        diversity_weight=diversity_weight,
+    )
+    strongest = ranked.iloc[0]
     card(
         "STRONGEST OBSERVED OPPORTUNITY",
         str(strongest["opportunity"]),
@@ -1182,35 +1278,40 @@ def section_opportunities(
         f"<span class='ade-meta'>Reasoning: {_esc(strongest['reasoning'])}</span>",
         accent="#fbbf24",
     )
-    table = opportunities[
-        ["rank", "opportunity", "evidence_count", "source_count", "signal_score", "reasoning"]
+    table = ranked[
+        ["rank", "opportunity", "evidence_count", "source_count", "priority_score", "reasoning"]
     ].rename(
         columns={
             "rank": "#",
             "opportunity": "Opportunity hypothesis",
             "evidence_count": "Records",
             "source_count": "Sources",
-            "signal_score": "Signal",
+            "priority_score": "Priority score",
             "reasoning": "Why it ranks here",
         }
     )
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
     st.download_button(
         "Download opportunity table CSV",
-        opportunities.to_csv(index=False).encode("utf-8"),
+        ranked.to_csv(index=False).encode("utf-8"),
         file_name="opportunity_hypotheses.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
     selected = st.selectbox(
         "Inspect evidence for an opportunity",
-        opportunities["theme"].tolist(),
+        ranked["theme"].tolist(),
         format_func=lambda theme: THEME_RULES[theme]["label"],
     )
-    row = opportunities[opportunities["theme"] == selected].iloc[0]
+    row = ranked[ranked["theme"] == selected].iloc[0]
     st.markdown(f"**Why this ranks:** {_esc(row['reasoning'])}")
     st.caption(THEME_RULES[selected]["problem"])
-    hits = evidence[evidence["evidence_id"].isin(row["evidence_ids"])].head(8)
+    supporting = evidence[evidence["evidence_id"].isin(row["evidence_ids"])]
+    hits = supporting.head(8)
+    st.caption(
+        f"{_fmt(len(supporting))} supporting record(s) for this opportunity; "
+        f"showing the first {_fmt(len(hits))}."
+    )
     for _, record in hits.iterrows():
         st.markdown(
             f"<div class='ade-quote'>“{_esc(record['original_text'][:420])}”"
@@ -1246,7 +1347,7 @@ def section_qa(evidence: pd.DataFrame, source_label: str) -> None:
             placeholder="What do users say about payment failures and SIP continuation?",
         )
         terms = _custom_terms(question)
-    if st.button("Search evidence", type="primary", use_container_width=True):
+    if st.button("Search evidence", type="primary", width="stretch"):
         if not question.strip():
             st.warning("Enter a question.")
         else:
@@ -1275,6 +1376,23 @@ def section_qa(evidence: pd.DataFrame, source_label: str) -> None:
         unsafe_allow_html=True,
     )
     st.caption("Matched terms: " + ", ".join(answer["matched_terms"]))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Supporting records", _fmt(answer.get("volume", len(answer["hits"]))))
+    m2.metric("Distinct sources", _fmt(answer.get("diversity", 0)))
+    m3.metric("Confidence", "Low")
+    with st.expander("Structured answer details", expanded=False):
+        st.markdown(
+            f"**Confidence:** {_esc(answer.get('confidence', 'Low'))}  \n"
+            f"**Citations:** {', '.join(answer.get('citations', [])) or 'None'}  \n"
+            f"**Locators:** {', '.join(answer.get('locators', [])) or 'None'}  \n"
+            f"**Contradictions:** {_esc(answer.get('contradictions', 'Not assessed automatically.'))}"
+        )
+        st.markdown("**Limitations**")
+        for item in answer.get("limitations", []):
+            st.markdown(f"- {item}")
+        st.markdown("**Gaps**")
+        for item in answer.get("gaps", []):
+            st.markdown(f"- {item}")
     for _, record in answer["hits"].iterrows():
         with st.expander(f"{record['evidence_id']} · {record['source_name']} · {record['source_date']}"):
             st.write(record["original_text"])
@@ -1301,14 +1419,6 @@ def section_limitations(meta: dict[str, Any], source_label: str) -> None:
         ]
         for item in facts:
             st.markdown(f"- {item}")
-        m4 = meta.get("m4") or {}
-        if m4:
-            st.markdown(
-                f"- M4 Run 1 state: **{_esc(m4.get('state'))}**; "
-                f"Pass 1 {_fmt(m4.get('pass_1'))} annotations; "
-                f"Pass 2 {_fmt(m4.get('pass_2'))} annotations; "
-                f"sign-off {'recorded' if m4.get('signoff') else 'not recorded'}."
-            )
     with c2:
         st.markdown('<div class="ade-section-title">Interpretation limits</div>', unsafe_allow_html=True)
         limits = [
@@ -1316,7 +1426,6 @@ def section_limitations(meta: dict[str, Any], source_label: str) -> None:
             "Theme discovery uses transparent keyword rules, not a validated qualitative coding process.",
             "Opportunity rankings are hypotheses based on observed evidence volume and source diversity; they are not validated user needs.",
             "Research Q&A is extractive retrieval. It shows source text and does not generate synthetic findings.",
-            "Pass 2 is not imported and no reconciliation or sign-off has occurred in the application.",
             "No independent validation, inter-rater reliability or kappa is claimed.",
         ]
         for item in limits:
@@ -1338,38 +1447,53 @@ def section_export(
     st.markdown('<div class="ade-page-title">Export findings</div>', unsafe_allow_html=True)
     st.caption("Downloads contain only stored evidence and computed exploratory tables. No fabricated content.")
     summary = mentor_summary(meta, themes, opportunities, source_label)
+    summary_bytes = summary.encode("utf-8")
+    evidence_bytes = evidence_download(evidence)
+    theme_bytes = theme_download(themes)
+    opportunity_bytes = opportunities.to_csv(index=False).encode("utf-8")
+
+    def export_note(filename: str, payload: bytes) -> None:
+        st.caption(
+            f"{filename} · {len(payload) / 1024:.1f} KB · payload generated; "
+            "browser download not verified."
+        )
+
     st.download_button(
         "Download mentor summary (Markdown)",
-        summary.encode("utf-8"),
+        summary_bytes,
         file_name="ai_discovery_mentor_summary.md",
         mime="text/markdown",
-        use_container_width=True,
+        width="stretch",
     )
+    export_note("ai_discovery_mentor_summary.md", summary_bytes)
     c1, c2, c3 = st.columns(3)
     with c1:
         st.download_button(
             "Evidence with citations (CSV)",
-            evidence_download(evidence),
+            evidence_bytes,
             file_name="evidence_with_citations.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
+        export_note("evidence_with_citations.csv", evidence_bytes)
     with c2:
         st.download_button(
             "Ranked themes (CSV)",
-            theme_download(themes),
+            theme_bytes,
             file_name="ranked_themes.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
+        export_note("ranked_themes.csv", theme_bytes)
     with c3:
         st.download_button(
             "Ranked opportunities (CSV)",
-            opportunities.to_csv(index=False).encode("utf-8"),
+            opportunity_bytes,
             file_name="ranked_opportunities.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
+        export_note("ranked_opportunities.csv", opportunity_bytes)
     with st.expander("Preview mentor summary", expanded=False):
         st.markdown(summary)
 
@@ -1410,10 +1534,6 @@ def main() -> None:
         .ade-card { background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #2dd4bf; border-radius: 14px; padding: 1rem 1.1rem; box-shadow: 0 8px 22px rgba(15,23,42,0.04); height: 100%; }
         .ade-card-title { font-size: 1.02rem; font-weight: 700; margin: 0.2rem 0 0.35rem; color: #0f172a; }
         .ade-card-body { color: #475569; font-size: 0.88rem; line-height: 1.55; }
-        .ade-status { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 0.9rem 1rem; display: grid; gap: 0.55rem; font-size: 0.86rem; }
-        .ade-status > div { display: flex; align-items: center; gap: 0.55rem; color: #334155; }
-        .ade-dot { width: 9px; height: 9px; border-radius: 50%; background: #cbd5e1; display: inline-block; }
-        .ade-dot.done { background: #14b8a6; box-shadow: 0 0 0 4px #ccfbf1; }
         .ade-meta { color: #64748b; font-size: 0.8rem; line-height: 1.6; }
         .ade-evidence { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 1rem; }
         .ade-evidence-text { font-size: 0.95rem; line-height: 1.65; color: #1e293b; }
@@ -1431,7 +1551,7 @@ def main() -> None:
         st.markdown('<div class="ade-brand">AI Discovery Engine</div>', unsafe_allow_html=True)
         st.markdown(
             '<div class="ade-brand-sub">Evidence → themes → opportunities.<br>'
-            "Read-only research corpus · traceable outputs.</div>",
+            "Traceable outputs.</div>",
             unsafe_allow_html=True,
         )
         st.divider()
@@ -1459,17 +1579,8 @@ def main() -> None:
             ],
             label_visibility="collapsed",
         )
-        st.divider()
-        st.caption("M4 research status")
-        live_meta = load_meta(str(DEFAULT_DB_PATH), DEFAULT_DB_PATH.stat().st_mtime_ns if DEFAULT_DB_PATH.exists() else 0)
-        m4 = live_meta.get("m4") or {}
-        if m4:
-            st.caption(
-                f"Run 1: {m4.get('state')} · Pass 1 {m4.get('pass_1')} · Pass 2 {m4.get('pass_2')}"
-            )
-        st.caption("Pass 2 import and sign-off remain pending. The app does not modify the live DB.")
 
-    active_db = DEFAULT_DB_PATH if source_choice == "Research corpus" else SANDBOX_DB
+    active_db = get_settings().db_path if source_choice == "Research corpus" else SANDBOX_DB
     if not active_db.exists():
         st.error(f"Database not found: {active_db}")
         return
