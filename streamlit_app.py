@@ -1328,40 +1328,20 @@ def section_qa(evidence: pd.DataFrame, source_label: str) -> None:
         f"Source: {source_label}. Answers are extractive retrieval over stored evidence, "
         "not generative claims. Supporting records are always shown."
     )
-    mode = st.radio(
-        "Question source",
-        ["Predefined research questions", "Custom question"],
-        horizontal=True,
+    choice = st.selectbox(
+        "Choose a question",
+        [item["title"] for item in PREDEFINED_QUESTIONS],
     )
-    if mode == "Predefined research questions":
-        choice = st.selectbox(
-            "Choose a question",
-            [item["title"] for item in PREDEFINED_QUESTIONS],
-        )
-        item = next(item for item in PREDEFINED_QUESTIONS if item["title"] == choice)
-        question = item["title"]
-        terms = item["terms"]
-    else:
-        question = st.text_area(
-            "Ask a question about the evidence",
-            placeholder="What do users say about payment failures and SIP continuation?",
-        )
-        terms = _custom_terms(question)
+    item = next(item for item in PREDEFINED_QUESTIONS if item["title"] == choice)
+    question = item["title"]
+    terms = item["terms"]
     if st.button("Search evidence", type="primary", width="stretch"):
-        if not question.strip():
-            st.warning("Enter a question.")
-        else:
-            answer = answer_question(
-                evidence,
-                question,
-                terms,
-                min_matches=2 if mode == "Predefined research questions" else 1,
-            )
-            st.session_state["qa_result"] = {
-                "question": question,
-                "answer": answer,
-                "source_label": source_label,
-            }
+        answer = answer_question(evidence, question, terms)
+        st.session_state["qa_result"] = {
+            "question": question,
+            "answer": answer,
+            "source_label": source_label,
+        }
     state = st.session_state.get("qa_result")
     if not state or state.get("source_label") != source_label:
         st.info("Ask a question to retrieve the closest supporting evidence.")
