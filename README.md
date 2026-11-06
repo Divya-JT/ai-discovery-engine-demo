@@ -16,7 +16,7 @@ This is a **separate, sanitized deployment copy**. It does not include the live 
 
 ## Demo data
 
-The demo DB contains **456 public evidence records** and **33 sources**:
+The demo DB contains **461 public evidence records** and **38 sources**:
 
 | Source | Records |
 |---|---:|
@@ -24,19 +24,21 @@ The demo DB contains **456 public evidence records** and **33 sources**:
 | Google Play reviews | 122 |
 | Reddit posts/comments | 24 |
 | Website/Forum | 1 |
-| **Total** | **456** |
+| Interview transcripts | 5 |
+| **Total** | **461** |
 
 Sanitization applied:
 
-- authors replaced with `anonymous`;
-- `source_metadata_json` cleared to `{}`;
+- non-interview authors are anonymized; interview records use pseudonymous IDs `INT-01`–`INT-05`;
+- non-interview `source_metadata_json` is cleared to `{}`; interview records retain only pseudonymous, non-identifying metadata;
+- the five interview records contain only their primary quote, with no participant names, source filenames, raw transcript files, phone numbers or other PII;
 - duplicate rows omitted; demo records are unique;
 - all screening, annotation, provenance, result, AI-draft, review, freeze, event, rejected-row and audit tables are empty;
 - emails, phone numbers, handles, personal-profile links and username-heavy forum thread text excluded;
 - no private survey responses or contact details;
 - no `.env`, credentials, API keys, live DB, signed artifacts or research governance records.
 
-The full research corpus has 502 records; the demo is a safer, smaller subset for public evaluator access.
+The full research corpus has 502 records; the demo adds five sanitized interview records to a safer public subset for evaluator access.
 
 ## Local run
 
@@ -79,8 +81,9 @@ The demo DB is a public subset, not the full research corpus. It must not be use
 
 ## Demo database integrity
 
-- Evidence records: 456; sources: 33
+- Evidence records: 461; sources: 38
+- Interview records: 5 (`source_type='interview'`, pseudonymous IDs `INT-01`–`INT-05`)
 - SQLite journal mode: `DELETE` (single self-contained file; no WAL sidecars)
-- SHA-256: `2c55f287cdc1fbdaf1eb6f3e6e6a34b92161be58dbe925725127f21ba4f214e6`
+- SHA-256: `25fb488bbc70f9d3e2aed128ca5a8ec7effac7e90e2ca0c031078bf11393d2a1`
 - Only `schema_migrations`, `sources` and `evidence` contain rows; all screening, annotation, result, AI, review, freeze, event, rejected-row and audit tables are empty.
 
